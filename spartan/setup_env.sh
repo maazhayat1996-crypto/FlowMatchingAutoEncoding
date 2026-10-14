@@ -18,7 +18,7 @@ set -eo pipefail
 FM_PROJECT=${FM_PROJECT:-/data/gpfs/projects/<projectID>}
 case $FM_PROJECT in *"<projectID>"*) echo "set FM_PROJECT or edit <projectID> in spartan/setup_env.sh first" >&2; exit 1;; esac
 VENV=${VENV:-$HOME/venvs/fmpe}
-TORCH_INDEX=${TORCH_INDEX:-https://download.pytorch.org/whl/cu126}
+TORCH_INDEX=${TORCH_INDEX:-https://download.pytorch.org/whl/cu126}   # <-- PLACEHOLDER: match the driver (see top)
 TORCH_VERSION=${TORCH_VERSION:-2.14.1}
 
 module purge
@@ -40,7 +40,7 @@ python -m pip install --upgrade pip
 python -m pip install "torch==$TORCH_VERSION" --index-url "$TORCH_INDEX"
 python -m pip install -r requirements.txt
 python -m pip check
-python -c "import sbi, torch, numpy; print('sbi', sbi.__version__, '| torch', torch.__version__, '| CUDA', torch.version.cuda, '| numpy', numpy.__version__)"
+python -c "import sys, sbi, torch, numpy, scipy, zuko; print('python', sys.version.split()[0], '| sbi', sbi.__version__, '| torch', torch.__version__, '| CUDA', torch.version.cuda, '| numpy', numpy.__version__, '| scipy', scipy.__version__, '| zuko', zuko.__version__)"
 
-mkdir -p "$FM_PROJECT/fmpe/runs" "$FM_PROJECT/fmpe/logs"
-echo "venv ready at $VENV; Slurm logs go to $FM_PROJECT/fmpe/logs"
+mkdir -p "$FM_PROJECT/fmpe/runs/logs"
+echo "venv ready at $VENV; Slurm logs go to $FM_PROJECT/fmpe/runs/logs"

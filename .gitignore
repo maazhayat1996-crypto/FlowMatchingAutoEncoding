@@ -19,3 +19,6 @@ logs/
 *.npy
 *.pt
 *.pkl
+
+# Tier 1 artefacts
+checkpoint.pkl

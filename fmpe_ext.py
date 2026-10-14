@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 import warnings
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,7 @@ class ChunkedFMPE(FMPE):
         self.sbi_converged = False        # sbi's early-stopping criterion fired
         self._chunk_end: int | None = None
         self._last_check: tuple[int, bool] | None = None
+        self.train_pass_s: list[float] = []   # wall time of each epoch's training pass
 
     # ---- training in chunks ------------------------------------------------ #
 
@@ -122,6 +124,16 @@ class ChunkedFMPE(FMPE):
         if conv:
             return True
         return self._chunk_end is not None and epoch >= self._chunk_end
+
+    def _train_epoch(self, train_loader, clip_max_norm, loss_args):
+        # Time the optimisation pass alone (no validation) for ms/step; the
+        # per-batch loss.item() inside sbi's loop already synchronises CUDA.
+        t0 = time.time()
+        loss = super()._train_epoch(train_loader, clip_max_norm, loss_args)
+        if not hasattr(self, "train_pass_s"):          # checkpoints from older versions
+            self.train_pass_s = []
+        self.train_pass_s.append(time.time() - t0)
+        return loss
 
     def _report_convergence_at_end(self, epoch: int, max_num_epochs: int) -> None:
         # Stay quiet at chunk boundaries; sbi would announce "converged".

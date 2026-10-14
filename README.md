@@ -6,96 +6,93 @@ Reproduces the FMPE pipeline of arXiv:2608.15042 (Kitagawa, Nishimura, Otsuka).
 |---|---|
 | `simulate.py` | forward model G (23) -> L (11), observables T, chi^2 (Eq. 3.15); `python simulate.py` runs the self-test |
 | `trainer.py` | simulate, train FMPE (sbi 0.27, transformer vector field), sample the posterior at the NuFIT 6.0 best fit |
-| `fmpe_ext.py` | sbi extension: training in chunks, checkpoint/resume, fast batch loader |
-| `sample_posterior.py` | extra posterior draws from a trained run (one Slurm array task per seed) |
-| `merge_samples.py` | combine `RUN/samples/*` into `RUN/G_samples.npy` / `chi2.npy` |
+| `fmpe_ext.py` | sbi extension: training in chunks, checkpoint/resume, fast batch loader, ms/step timing |
+| `sample_posterior.py` | posterior draws from a trained run (one Slurm array task per seed); `--benchmark` |
+| `merge_samples.py` | combine `RUN/samples/*` into `RUN/G_samples.npy` / `chi2.npy` / `samples_summary.json` |
 | `plot_posterior.py` | figures from `G_samples.npy` / `chi2.npy` into `RUN/figures/` |
 | `spartan/` | Slurm scripts and the one-time environment setup |
 
-Locally: `python trainer.py --quick --device cpu`, then `python plot_posterior.py runs/<timestamp>`.
+Locally: `python trainer.py --quick --device cpu`, then `python plot_posterior.py runs/<timestamp>`. Every hyperparameter is a flag; see `python trainer.py --help`.
 
-## Running on Spartan
+## Running on Spartan (Tier 1)
 
-Spartan is the University of Melbourne's Slurm cluster. Code lives in your project directory, environments in `~/venvs`, and results in `/data/gpfs/projects/<projectID>/fmpe/runs`. The workflow is: edit locally, `git push`, `git pull` on Spartan, `sbatch`.
+Tier 1 is a replica of the paper's run on one A100. It uses 1e7 training simulations, the sbi transformer vector field (100-dim tokens, 5 layers), and 3e6 posterior draws at the NuFIT 6.0 best fit.
 
-### 0. Fill in the placeholders (locally, once) and push
+**Pass criterion (the paper's numbers):** of 3e6 draws, 956,607 (31.9%) have chi^2 < 2500 and 640 (0.021%) have chi^2 < 45. Tier 1 succeeds with about 600 or more samples below 45. The run should also record ms/step and sampling samples/s, so that the next tier can be sized from measurements. For reference, our earlier Mac run (1e6 sims, 1e5 draws) reached 19.8% below 2500 and 3 samples below 45.
 
-`<projectID>` appears in `spartan/*.slurm` (in the `#SBATCH -o/-e` lines and in `FM_PROJECT`) and in `spartan/setup_env.sh`. The scripts refuse to run until it is filled in:
+### Two placeholders to fill (locally, once)
 
-```bash
-sed -i '' 's/<projectID>/punim1234/g' spartan/*.slurm spartan/setup_env.sh   # macOS sed
-git commit -am "Set Spartan project ID" && git push
-```
+1. **`<projectID>`**, your Spartan project (e.g. `punim1234`). It appears in every `spartan/*.slurm` file (in the `#SBATCH -o/-e` lines and in `FM_PROJECT`) and in `spartan/setup_env.sh`. The scripts refuse to run until it is filled in:
+   ```bash
+   sed -i '' 's/<projectID>/punim1234/g' spartan/*.slurm spartan/setup_env.sh   # macOS sed
+   git commit -am "Set Spartan project ID" && git push
+   ```
+   The scripts assume the repository is checked out at `/data/gpfs/projects/<projectID>/FlowMatchingAutoEncoding` (`FM_REPO`).
+2. **The torch wheel index** (`TORCH_INDEX` in `spartan/setup_env.sh`, default `cu126`). It must be a CUDA version the GPU driver supports. The smoke test prints `nvidia-smi`; if it then reports `False` for CUDA, follow the fallback comment at the top of `setup_env.sh`.
 
-### 1. Clone and build the environment (login node)
+### Steps
 
+**1. Clone and build the environment** (login node; no computation):
 ```bash
 ssh <username>@spartan.hpc.unimelb.edu.au
 cd /data/gpfs/projects/<projectID>
 git clone https://github.com/maazhayat1996-crypto/FlowMatchingAutoEncoding.git
 cd FlowMatchingAutoEncoding
-bash spartan/setup_env.sh          # venv in ~/venvs/fmpe, also creates fmpe/runs and fmpe/logs
+bash spartan/setup_env.sh        # ~/venvs/fmpe; also creates fmpe/runs/logs
 ```
+To use Python 3.11 instead, check `module spider Python/3.11.3` and change the `module load` line in `setup_env.sh` and in every `spartan/*.slurm`.
 
-`setup_env.sh` installs torch 2.14.1 from the `cu126` wheel index before `requirements.txt`. If the smoke test shows that CUDA is not usable, see the comment at the top of the script. To use Python 3.11 instead of 3.10, check `module spider Python/3.11.3` and change the `module load` line in `setup_env.sh` and in every `spartan/*.slurm`.
-
-### 2. Smoke test (about 10 min on `gpu-a100-short`)
-
+**2. Smoke test** (`gpu-a100-short`, at most 30 min):
 ```bash
 sbatch spartan/smoke.slurm
-squeue --me
-less /data/gpfs/projects/<projectID>/fmpe/logs/fmpe-smoke-<jobid>.out
+less /data/gpfs/projects/<projectID>/fmpe/runs/logs/fmpe-smoke-<jobid>.out
 ```
-
 Check the following in the log:
-- `nvidia-smi` prints a driver whose CUDA version is at least the wheel's (12.6).
-- `True 12.6` appears, i.e. `torch.cuda.is_available()` and `torch.version.cuda`.
-- The quick training run finishes.
-- The 200k-sample chunk reports its `peak GPU memory`. If it is close to 80 GiB, lower `--chunk` in `sample.slurm` and `--sample-chunk` for `trainer.py`.
+- `True 12.x NVIDIA A100...` from the torch check, and a driver CUDA version in `nvidia-smi` at least as new as the wheel's.
+- A `[train] ... ms/step` line. This is the quick run's training speed.
+- The `[benchmark] chunk ...: N samples/s` lines, with peak GPU memory, for 50k/200k/500k chunks. Sizes that would not fit in 10 minutes are skipped, and an out-of-memory size is reported. The quick network is barely trained, so these rates are only indicative.
+- The `--n 20000 --tag smoke` draw finishes, and `figures/` is written.
 
-### 3. Train at paper scale (1e7 simulations, 3e6 posterior draws)
-
+**3. Train** (`gpu-a100`, 8 h; batch 1024, lr 1e-3, early stopping with patience 20, plus 2e5 in-job draws as a sanity check):
 ```bash
-sbatch spartan/train.slurm
+sbatch spartan/train_tier1.slurm
+squeue --me
+tail -f /data/gpfs/projects/<projectID>/fmpe/runs/<timestamp>-<jobid>/logs/train-<jobid>.log
+```
+- The first job simulates 1e7 points and caches them in `fmpe/runs/sims_1e7_seed0.npz` (about 1.4 GB). Later runs with seed 0 load the cache.
+- Each `[train]` line reports the validation loss, s/epoch and ms/step for the last chunk of 10 epochs.
+- The run is done when `<run>/summary.json` exists. It holds the epochs trained, best validation loss, `ms_per_step` (training pass only) and `ms_per_step_incl_validation`, the wall times, `sampling_samples_per_s` of the trained network, the chi^2 counts, the git commit, host and GPU.
+
+**4. Bulk draws** (10 array tasks x 3e5 = 3e6). Size them first: each task needs `300000 / sampling_samples_per_s` seconds (from `summary.json`) plus a few minutes. Edit `--n`, `--array` or `--time` in `spartan/sample_tier1.slurm` if needed. `gpu-a100-short` allows at most 4 h, and a task close to its limit stops 5 min early and keeps what it has.
+```bash
+FM_RUN=/data/gpfs/projects/<projectID>/fmpe/runs/<run> sbatch spartan/sample_tier1.slurm   # prints <array id>
+FM_RUN=/data/gpfs/projects/<projectID>/fmpe/runs/<run> sbatch --dependency=afterok:<array id> spartan/merge_tier1.slurm
+```
+The merge combines the array draws (`samples/1..10_*`) with the training job's own draws (`samples/train_*`). It writes `G_samples.npy`, `chi2.npy`, `G_chi2_lt_45.npy`, `G_chi2_lt_2500.npy` and `samples_summary.json`, prints the totals and fractions, and draws the figures. Every sampling call also appends a line to `<run>/samples/log.jsonl`.
+
+**5. Monitor:**
+```bash
+squeue --me
+sacct -j <jobid> --format=JobID,JobName,Elapsed,MaxRSS,State
 ```
 
-- The run directory is `fmpe/runs/<timestamp>-<jobid>`. The log is `<run>/logs/train-<jobid>.log`, and Slurm's own `-o/-e` files go to `fmpe/logs/`.
-- The 1e7 simulations are cached in `fmpe/runs/sims_1e7_seed0.npz` (about 1.4 GB). Later runs with the same seed and label mode load them instead of simulating again.
-- Training checkpoints every 10 epochs (`checkpoint.pkl`, `estimator_state.pt`). If sbi's early stopping has not fired 20 minutes before the 36 h wall time, the job saves, exits with status 3 and resubmits itself as `spartan/train.slurm --resume <run>` (`afterany` dependency, at most 5 times; set `FM_MAX_RESUBMIT` to change this). A resumed run continues exactly where it stopped: same weights, Adam state, train/validation split, early-stopping counters and RNG state. To resume by hand: `sbatch spartan/train.slurm --resume <run>`.
-- Monitor with `squeue --me`, `sacct -j <jobid> --format=JobID,Elapsed,MaxRSS,State`, and `tail -f <run>/logs/train-*.log`. TensorBoard logs are in `<run>/tb`.
-- The run is finished when `<run>/summary.json` exists. It holds epochs, losses, wall times and the chi^2 counts below 45/100/2500.
-- Extra `trainer.py` flags can be appended, e.g. `sbatch spartan/train.slurm --batch 4096 --lr 1e-3`. `python trainer.py --help` lists them all.
-
-### 4. More posterior samples (10 x 2e6 draws), then merge and plot
-
-```bash
-sbatch spartan/sample.slurm <run>                                # prints the array job id
-sbatch --dependency=afterok:<array job id> spartan/merge.slurm <run>
-```
-
-Each array task writes `<run>/samples/<task>_G.npy` and `_chi2.npy`, using seeds 1..10. The trainer's own draws are in `samples/train_*` and use the training seed (0). `merge.slurm` concatenates every set into `G_samples.npy`, `chi2.npy`, `G_chi2_lt_45.npy` and `G_chi2_lt_2500.npy`, and then runs `plot_posterior.py`.
-
-### 5. Pull the results to the Mac
-
-Spartan cannot ssh out, so pull from the Mac. This copies the figures, summaries, the chi^2 < 45 samples and the logs, but not the large sample files or checkpoints:
-
+**6. Pull the results to the Mac.** Spartan cannot ssh out, so run this on the Mac:
 ```bash
 RUN=<timestamp>-<jobid>
 rsync -avzm --include='*/' --include='figures/***' --include='logs/***' \
-    --include='summary.json' --include='config.json' --include='merged.json' \
-    --include='G_chi2_lt_45.npy' --include='estimator.pt' --exclude='*' \
+    --include='summary.json' --include='samples_summary.json' --include='config.json' \
+    --include='log.jsonl' --include='G_chi2_lt_45.npy' --exclude='*' \
     <username>@spartan.hpc.unimelb.edu.au:/data/gpfs/projects/<projectID>/fmpe/runs/$RUN/ runs/$RUN/
 ```
+`.pt` files open on a Mac with `torch.load(path, map_location="cpu", weights_only=False)`.
 
-`.pt` files open on a Mac with `torch.load(path, map_location="cpu", weights_only=False)`. To sample locally, run `python sample_posterior.py runs/$RUN --n 10000 --device cpu`.
+### Resume behaviour
+Training checkpoints after every 10 epochs (`checkpoint.pkl` and `estimator_state.pt`). The time budget is the Slurm end time minus 20 minutes, read from `$SLURM_JOB_END_TIME`, `scontrol show job` or `squeue`. If sbi's early stopping has not fired before the budget would be exceeded, `trainer.py` saves and exits with status 3. The job then resubmits itself with `FM_RESUME=<run>` and an `afterany` dependency on itself, at most 5 times (`FM_MAX_RESUBMIT`).
 
-### Label modes
+A resumed run continues exactly where it stopped, with the same weights, Adam state, train/validation split, early-stopping counters and RNG state. Locally it reproduces the uninterrupted loss curve bit for bit. To resume by hand, run `FM_RESUME=<run dir> sbatch spartan/train_tier1.slurm`. Set `FM_RESUME` only on that command line; an exported `FM_RESUME` would turn later submissions into resumes.
 
-These two modes define different posteriors. The mode is recorded in `config.json` and `summary.json`, and is printed in the banner.
-
-- `--labels L` (default) is the paper's construction: the network is conditioned on the 11-dim deterministic label L(G) (two log mass splittings, nine |U_PMNS| entries) and evaluated at L built from the NuFIT best fit.
-- `--labels T --label-noise` conditions on the five fitted observables T(G) plus Gaussian noise whose sigmas are the ones in `chi2()`, and evaluates at the NuFIT best-fit T. With noisy labels the network learns the Bayesian posterior p(G | T_obs), whose likelihood is proportional to exp(-chi^2/2). Use a separate simulation cache:
-  ```bash
-  SIMS_CACHE=/data/gpfs/projects/<projectID>/fmpe/runs/sims_1e7_seed0_Tnoise.npz \
-      sbatch spartan/train.slurm --labels T --label-noise
-  ```
+### Notes
+- The training data lives on the GPU: sbi 0.27's `append_simulations` takes `data_device`, and it defaults to the training device.
+- sbi's ODE sampler (zuko, adaptive) exposes only `atol`/`rtol`, available as `--ode-atol`/`--ode-rtol` (sbi defaults 1e-6 / 1e-5). There is no step count.
+- TF32 matmuls are on for training on CUDA (`--no-tf32` disables them) and always off for sampling.
+- Larger tiers use `spartan/train.slurm`, which passes its arguments to `trainer.py`. See the header of that script.

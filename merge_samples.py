@@ -5,7 +5,7 @@ sample_posterior.py) into the files plot_posterior.py reads:
     python merge_samples.py RUN_DIR
 
 Writes RUN_DIR/G_samples.npy, chi2.npy, G_chi2_lt_45.npy, G_chi2_lt_2500.npy and
-merged.json, and prints the totals.  Idempotent: it only reads samples/.
+samples_summary.json, and prints the totals.  Idempotent: it only reads samples/.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ def merge(run: Path, log=lambda s: print(s, flush=True)) -> dict:
     np.save(run / "G_chi2_lt_45.npy", G[c < 45])
     np.save(run / "G_chi2_lt_2500.npy", G[c < 2500])
     st = dict(tags=tags, **SP.stats(c, n_drawn=n_drawn))
-    (run / "merged.json").write_text(json.dumps(st, indent=2))
+    (run / "samples_summary.json").write_text(json.dumps(st, indent=2))
     log(f"merged {len(tags)} sets: " + SP.format_stats(st))
     return st
 

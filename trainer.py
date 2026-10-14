@@ -4,17 +4,17 @@ arXiv:2608.15042 (Sec. 3).  Forward model lives in simulate.py.
 
 Usage
 -----
-    python trainer.py --quick            # ~1 min smoke test on CPU
-    python trainer.py                    # full run (1e6 sims, paper-like settings)
-    python trainer.py --n-sims 10000000 --n-post 3000000 \
-        --sims-cache $FM_RUNS_DIR/sims_1e7_seed0.npz      # paper scale (Spartan)
+    python trainer.py --quick            # ~2 min smoke test on CPU
+    python trainer.py                    # 1e6 sims
+    python trainer.py --n-sims 10000000 --n-post 200000 --batch 1024 --lr 1e-3 \
+        --sims-cache $FM_RUNS_DIR/sims_1e7_seed0.npz      # Tier 1 (spartan/train_tier1.slurm)
     python trainer.py --resume RUN_DIR   # continue an interrupted run
 
 Training runs in chunks of --epochs-per-chunk epochs and checkpoints after each.
 If the wall-time budget (--time-budget-h, or the Slurm job end time minus 20 min)
 would be exceeded before sbi's early stopping fires, the run saves and exits
-with status 3; `--resume RUN_DIR` continues it (spartan/train.slurm resubmits
-itself automatically).
+with status 3; `--resume RUN_DIR` continues it (spartan/train*.slurm resubmit
+themselves automatically).
 
 Label modes (they define different posteriors; recorded in config/summary):
     --labels L                 paper default: 11-dim deterministic label L(G)
@@ -29,10 +29,13 @@ Outputs (in --out; default $FM_RUNS_DIR/<timestamp>-<jobid> or runs/<timestamp>)
     estimator_state.pt    its state_dict
     posterior.pt          the sbi posterior object, on CPU
     samples/train_*.npy   this run's posterior draws (more via sample_posterior.py)
+    samples/log.jsonl     one line per sampling call (counts, samples/s)
     G_samples.npy         all draws in samples/ that lie in the prior box (merged)
     chi2.npy              chi^2 (Eq. 3.15) of every sample in G_samples.npy
     G_chi2_lt_45.npy, G_chi2_lt_2500.npy
-    summary.json          epochs, losses, wall times, chi^2 statistics
+    summary.json          epochs, losses, ms/step, wall times, samples/s, chi^2
+                          statistics, git commit, host, GPU, all args
+    samples_summary.json  totals over all sample sets (merge_samples.py)
     tb/                   TensorBoard logs
 Load .pt files with torch.load(path, map_location="cpu", weights_only=False).
 """
@@ -47,14 +50,13 @@ import math
 import multiprocessing as mp
 import os
 import platform
-import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
+import sbi
 from sbi.neural_nets import posterior_flow_nn
 from sbi.utils.tracking import TensorBoardTracker
 from torch.utils.tensorboard.writer import SummaryWriter
@@ -70,7 +72,8 @@ SAFETY_MARGIN_S = 20 * 60
 
 # Settings that may be changed when resuming; everything else comes from config.json.
 RUNTIME_KEYS = {"device", "data_device", "workers", "time_budget_h", "epochs_per_chunk",
-                "n_post", "sample_chunk", "ode_atol", "ode_rtol", "max_epochs", "logdir"}
+                "n_post", "sample_chunk", "ode_atol", "ode_rtol", "max_epochs", "logdir",
+                "tf32"}
 QUICK = dict(n_sims=20_000, n_post=2_000, max_epochs=3, stop_after=2)
 
 
@@ -111,6 +114,13 @@ def build_parser(suppress: bool = False) -> argparse.ArgumentParser:
     # network and optimiser
     add("--hidden", type=int, default=100)
     add("--layers", type=int, default=5)
+    # remaining transformer builder kwargs of posterior_flow_nn; defaults are sbi 0.27's
+    add("--heads", type=int, default=10, help="attention heads (must divide --hidden)")
+    add("--mlp-ratio", type=int, default=4, help="transformer MLP width / hidden")
+    add("--t-emb-dim", type=int, default=32, help="time embedding dimension")
+    add("--time-emb", choices=["sinusoidal", "fourier"], default="sinusoidal")
+    add("--sinusoidal-max-freq", type=float, default=1000.0)
+    add("--fourier-scale", type=float, default=30.0)
     add("--batch", type=int, default=2048)
     add("--lr", type=float, default=5e-4)
     add("--val-frac", type=float, default=0.1)
@@ -122,6 +132,8 @@ def build_parser(suppress: bool = False) -> argparse.ArgumentParser:
     # hardware, budget, outputs
     add("--device", default=SP.default_device())
     add("--data-device", default=None, help="where training data lives (default: --device)")
+    add("--tf32", action=argparse.BooleanOptionalAction, default=None,
+        help="TF32 matmuls during training (default: on for cuda); sampling always uses fp32")
     add("--time-budget-h", type=float, default=None,
         help="wall-time budget in hours (default: Slurm job end minus 20 min, else none; "
              "<=0: none)")
@@ -131,8 +143,8 @@ def build_parser(suppress: bool = False) -> argparse.ArgumentParser:
     # posterior sampling
     add("--n-post", type=int, default=100_000, help="posterior samples to draw")
     add("--sample-chunk", type=int, default=200_000)
-    add("--ode-atol", type=float, default=None, help="ODE solver atol (sbi default 1e-6)")
-    add("--ode-rtol", type=float, default=None, help="ODE solver rtol (sbi default 1e-5)")
+    add("--ode-atol", type=float, default=SP.ODE_ATOL_DEFAULT, help="ODE solver atol (sbi default)")
+    add("--ode-rtol", type=float, default=SP.ODE_RTOL_DEFAULT, help="ODE solver rtol (sbi default)")
     return p
 
 
@@ -175,6 +187,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         a.out = default_out()
     if a.logdir is None:
         a.logdir = a.out / "tb"
+    if a.tf32 is None:
+        a.tf32 = a.device.startswith("cuda")
     a.resume = False
     return a
 
@@ -202,18 +216,6 @@ def to_jsonable(d: dict) -> dict:
 # Time budget
 # --------------------------------------------------------------------------- #
 
-def _slurm_seconds(s: str) -> float | None:
-    """Parse Slurm's [D-]HH:MM:SS / MM:SS time format."""
-    s = s.strip()
-    if not s or not s[0].isdigit():
-        return None                                   # UNLIMITED, INVALID, ...
-    days, _, hms = s.rpartition("-")
-    parts = [float(x) for x in hms.split(":")]
-    while len(parts) < 3:
-        parts.insert(0, 0.0)
-    return (float(days or 0) * 24 + parts[0]) * 3600 + parts[1] * 60 + parts[2]
-
-
 def deadlines_from_args(a: argparse.Namespace) -> tuple[float | None, float | None]:
     """
     Absolute time.time() values (train, sample) by which training must have
@@ -223,19 +225,28 @@ def deadlines_from_args(a: argparse.Namespace) -> tuple[float | None, float | No
     if a.time_budget_h is not None:
         d = None if a.time_budget_h <= 0 else T_START + a.time_budget_h * 3600
         return d, d
-    end = None
-    if os.environ.get("SLURM_JOB_END_TIME"):
-        end = float(os.environ["SLURM_JOB_END_TIME"])
-    elif os.environ.get("SLURM_JOB_ID") and shutil.which("squeue"):
-        with contextlib.suppress(Exception):
-            left = subprocess.run(["squeue", "-h", "-j", os.environ["SLURM_JOB_ID"], "-o", "%L"],
-                                  capture_output=True, text=True, timeout=60).stdout
-            secs = _slurm_seconds(left.splitlines()[0]) if left.strip() else None
-            if secs:
-                end = time.time() + secs
+    end = SP.slurm_end_time()
     if end is None:
         return None, None
     return end - SAFETY_MARGIN_S, end - SAFETY_MARGIN_S / 2
+
+
+def git_commit() -> str | None:
+    """HEAD commit of the repository this file lives in (read directly, no git binary)."""
+    g = Path(__file__).resolve().parent / ".git"
+    try:
+        head = (g / "HEAD").read_text().strip()
+        if not head.startswith("ref: "):
+            return head
+        ref = head[5:]
+        if (g / ref).exists():
+            return (g / ref).read_text().strip()
+        for line in (g / "packed-refs").read_text().splitlines():
+            if line.endswith(" " + ref):
+                return line.split()[0]
+    except OSError:
+        pass
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -323,11 +334,15 @@ def get_simulations(a: argparse.Namespace) -> tuple[torch.Tensor, torch.Tensor, 
 def main(argv: list[str] | None = None) -> int:
     a = parse_args(argv)
     a.out.mkdir(parents=True, exist_ok=True)
+    if a.tf32 is None:                     # resuming a run made before --tf32 existed
+        a.tf32 = a.device.startswith("cuda")
+    gpu = SP.gpu_name(a.device)
     if not a.resume:
         cfg = to_jsonable({k: v for k, v in vars(a).items() if k != "resume"})
         cfg.update(created=time.strftime("%Y-%m-%d %H:%M:%S"),
                    slurm_job_id=os.environ.get("SLURM_JOB_ID"), host=platform.node(),
                    python=platform.python_version(), torch=torch.__version__,
+                   sbi=sbi.__version__, gpu=gpu, git_commit=git_commit(),
                    mode=mode_description(a))
         (a.out / "config.json").write_text(json.dumps(cfg, indent=2))
     a.logdir = Path(a.logdir) if a.logdir is not None else a.out / "tb"
@@ -337,16 +352,16 @@ def main(argv: list[str] | None = None) -> int:
 
     log("=" * 78)
     log(f"FMPE seesaw  {'RESUME ' if a.resume else ''}run dir: {a.out}")
+    log(f"device={a.device}  gpu={gpu}  torch={torch.__version__} (CUDA {torch.version.cuda})  "
+        f"sbi={sbi.__version__}  python={platform.python_version()}  host={platform.node()}  "
+        f"commit={(git_commit() or '?')[:10]}  tf32={a.tf32}")
     log(f"label mode   {mode_description(a)}")
-    log(f"device={a.device}  data_device={a.data_device or a.device}  workers={workers}  "
+    log(f"data_device={a.data_device or a.device}  workers={workers}  "
         f"n_sims={a.n_sims:,}  n_post={a.n_post:,}  batch={a.batch}  lr={a.lr}  "
-        f"hidden={a.hidden}  layers={a.layers}  seed={a.seed}")
+        f"hidden={a.hidden}  layers={a.layers}  heads={a.heads}  seed={a.seed}")
     log("time budget  " + ("none" if deadline is None else
                            f"until {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(deadline))}"
                            f" ({(deadline - time.time()) / 3600:.2f} h from now)"))
-    if a.device.startswith("cuda"):
-        log(f"cuda         {torch.cuda.get_device_name()}  torch {torch.__version__} "
-            f"(CUDA {torch.version.cuda})")
     log("=" * 78)
 
     torch.manual_seed(a.seed)
@@ -369,6 +384,9 @@ def main(argv: list[str] | None = None) -> int:
             hidden_features=a.hidden, num_layers=a.layers,
             z_score_theta="none",        # G already lives in a bounded box
             z_score_x="independent",     # Eq. 3.17: standardise each label
+            t_embedding_dim=a.t_emb_dim, time_emb_type=a.time_emb,
+            num_heads=a.heads, mlp_ratio=a.mlp_ratio,
+            sinusoidal_max_freq=a.sinusoidal_max_freq, fourier_scale=a.fourier_scale,
         )
         inf = ChunkedFMPE(prior=SP.box_prior(a.device), vf_estimator=vf_builder,
                           device=a.device, show_progress_bars=False,
@@ -378,6 +396,8 @@ def main(argv: list[str] | None = None) -> int:
         train_s, n_segments, finished = 0.0, 1, False
     n_valid = inf._theta_roundwise[0].size(0)
     del theta, x
+    n_train = int((1 - a.val_frac) * n_valid)          # sbi's split rule
+    steps_per_epoch = n_train // min(a.batch, n_train)
 
     # ---- train in chunks, checkpointing against the time budget ----------- #
     train_kwargs = dict(training_batch_size=a.batch, learning_rate=a.lr,
@@ -385,6 +405,8 @@ def main(argv: list[str] | None = None) -> int:
                         max_num_epochs=a.max_epochs,
                         clip_max_norm=a.clip_grad if a.clip_grad > 0 else None,
                         show_train_summary=False)
+    if a.device.startswith("cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = bool(a.tf32)
     while not finished:
         t0, e0 = time.time(), inf.epochs_trained
         finished = inf.train_chunk(a.epochs_per_chunk, **train_kwargs)
@@ -396,14 +418,21 @@ def main(argv: list[str] | None = None) -> int:
         torch.save(inf._neural_net.state_dict(), a.out / "estimator_state.pt")
         log(f"[train] epoch {inf.epochs_trained:4d}  val loss {inf._val_loss:.4f}  "
             f"best {inf.best_val_loss:.4f}  {dt / n_ep:.1f} s/epoch  "
+            f"{1000 * np.median(inf.train_pass_s[-n_ep:]) / steps_per_epoch:.2f} ms/step  "
             f"total train {train_s / 3600:.2f} h  checkpointed")
         if not finished and deadline is not None and time.time() + 1.2 * dt > deadline:
             log(f"[train] time budget exhausted after {inf.epochs_trained} epochs without "
                 f"convergence; resume with: python trainer.py --resume {a.out}")
             return EXIT_BUDGET
+    torch.backends.cuda.matmul.allow_tf32 = False          # TF32 for training only
+    # ms/step: median training-pass time / steps (excludes sbi's validation pass,
+    # which evaluates the validation set at 10 flow times); epoch_s includes it.
+    epoch_s = float(np.median(inf.summary["epoch_durations_sec"]))
+    ms_per_step = 1000 * float(np.median(inf.train_pass_s)) / steps_per_epoch
     why = "early stopping" if inf.sbi_converged else f"max_epochs={a.max_epochs}"
     log(f"[train] finished after {inf.epochs_trained} epochs ({why}), best val loss "
-        f"{inf.best_val_loss:.4f}, {train_s / 60:.1f} min of training")
+        f"{inf.best_val_loss:.4f}, {train_s / 60:.1f} min of training, "
+        f"{ms_per_step:.2f} ms/step ({steps_per_epoch:,} steps/epoch)")
 
     # ---- save estimator / posterior on the CPU ---------------------------- #
     est_cpu = copy.deepcopy(inf._neural_net).to("cpu").eval()
@@ -416,20 +445,28 @@ def main(argv: list[str] | None = None) -> int:
     posterior = SP.build_posterior(copy.deepcopy(est_cpu), a.device, a.ode_atol, a.ode_rtol)
     res = SP.draw(posterior, SP.conditioning_point(a.labels), a.n_post, a.sample_chunk,
                   seed=a.seed, deadline=sample_deadline)
-    SP.save_tag(a.out, "train", res, dict(seed=a.seed, device=a.device,
-                                          ode_atol=a.ode_atol, ode_rtol=a.ode_rtol))
-    st = SP.stats(res["chi2"], res["T"], res["n_drawn"])
+    st = SP.save_tag(a.out, "train", res, dict(seed=a.seed, device=a.device, gpu=gpu,
+                                               chunk=a.sample_chunk, ode_atol=a.ode_atol,
+                                               ode_rtol=a.ode_rtol))
     log("[sample] " + SP.format_stats(st))
+    log(f"[sample] {res['samples_per_s']:.1f} samples/s overall")
     MS.merge(a.out, log=lambda s: None)
 
     summary = dict(
-        mode=mode_description(a), labels=a.labels, label_noise=a.label_noise,
-        n_sims=a.n_sims, n_sims_valid=n_valid, epochs_trained=inf.epochs_trained,
-        converged=bool(inf.sbi_converged), best_val_loss=inf.best_val_loss,
-        n_segments=n_segments, n_post=a.n_post, sampling_complete=res["n_drawn"] >= a.n_post,
+        mode=mode_description(a), n_sims=a.n_sims, n_sims_valid=n_valid,
+        epochs_trained=inf.epochs_trained, converged=bool(inf.sbi_converged),
+        best_val_loss=inf.best_val_loss, steps_per_epoch=steps_per_epoch,
+        total_steps=steps_per_epoch * inf.epochs_trained, ms_per_step=ms_per_step,
+        ms_per_step_incl_validation=1000 * epoch_s / steps_per_epoch,
+        median_epoch_s=epoch_s, n_segments=n_segments,
         wall_s=dict(sim=sim_info["sim_s"], train_total=train_s, sample=res["seconds"],
                     this_job=time.time() - T_START),
+        n_post=a.n_post, sampling_complete=res["n_drawn"] >= a.n_post,
+        sampling_samples_per_s=res["samples_per_s"],
         **st,
+        git_commit=git_commit(), host=platform.node(), gpu=gpu,
+        torch=torch.__version__, sbi=sbi.__version__,
+        args=to_jsonable({k: v for k, v in vars(a).items()}),
     )
     (a.out / "summary.json").write_text(json.dumps(summary, indent=2))
     log(f"saved to {a.out}")
