@@ -10,3 +10,12 @@ venv/
 
 # macOS
 .DS_Store
+
+# Pipeline artefacts
+samples/
+*.npz
+tb/
+logs/
+*.npy
+*.pt
+*.pkl

@@ -1,0 +1,12 @@
+# Pinned for Python 3.10 / 3.11 (Spartan); all have cp310 + cp311 manylinux wheels.
+sbi==0.27.0
+# torch: on Spartan install it FIRST from the CUDA-specific index (spartan/setup_env.sh):
+#   pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu126
+# cu126 must be supported by the node driver (`nvidia-smi` in a GPU job). The
+# plain PyPI wheel may target a newer CUDA. On a Mac the PyPI wheel is fine.
+torch==2.14.1
+numpy==2.2.6
+scipy==1.15.3
+matplotlib==3.10.9
+zuko==1.6.0
+tensorboard==2.21.0

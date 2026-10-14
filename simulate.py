@@ -264,6 +264,14 @@ def observables_T(theta) -> np.ndarray:
     return T[0] if single else T
 
 
+def observables_T_chunked(theta, chunk: int = 500_000) -> np.ndarray:
+    """Same as `observables_T` for a batch, in chunks to bound memory.  Shape (N, 5)."""
+    theta, _ = _as_batch(theta)
+    if len(theta) == 0:
+        return np.empty((0, 5))
+    return np.concatenate([observables_T(theta[i:i + chunk]) for i in range(0, len(theta), chunk)])
+
+
 # --------------------------------------------------------------------------- #
 # NuFIT 6.0 (normal ordering, with SK atmospheric data), Table 1 of the paper
 # --------------------------------------------------------------------------- #
@@ -309,21 +317,79 @@ def labels_from_nufit_bestfit() -> np.ndarray:
     return L[None, :]
 
 
-def chi2(theta) -> np.ndarray:
+def nufit_T() -> tuple[np.ndarray, np.ndarray]:
     """
-    Eq. (3.15): chi^2 = 9 * sum_i (T_i - T_exp,i)^2 / (3 sigma_i)^2 over the five
-    components of T, with 3 sigma_i taken as half the 3-sigma interval width
-    (in log10 space for the mass-squared differences).
+    NuFIT 6.0 best fit of T (Eq. 3.14) and the half-width of its 3-sigma interval,
+    each of shape (5,), in log10 space for the mass-squared differences.
     """
-    T = np.atleast_2d(observables_T(theta))
     keys = ["dm21_meV2", "dm31_meV2", "s2_12", "s2_13", "s2_23"]
     best = np.array([NUFIT[k][0] for k in keys])
     lo = np.array([NUFIT[k][1] for k in keys])
     hi = np.array([NUFIT[k][2] for k in keys])
     best[:2], lo[:2], hi[:2] = np.log10(best[:2]), np.log10(lo[:2]), np.log10(hi[:2])
     sig3 = 0.5 * (hi - lo)
-    c = 9.0 * np.sum((T - best) ** 2 / sig3**2, axis=1)
+    return best, sig3
+
+
+def chi2_from_T(T: np.ndarray) -> np.ndarray:
+    """Eq. (3.15) evaluated on precomputed observables T of shape (N, 5)."""
+    best, sig3 = nufit_T()
+    return 9.0 * np.sum((np.atleast_2d(T) - best) ** 2 / sig3**2, axis=1)
+
+
+def chi2(theta) -> np.ndarray:
+    """
+    Eq. (3.15): chi^2 = 9 * sum_i (T_i - T_exp,i)^2 / (3 sigma_i)^2 over the five
+    components of T, with 3 sigma_i taken as half the 3-sigma interval width
+    (in log10 space for the mass-squared differences).
+    """
+    c = chi2_from_T(observables_T(theta))
     return c[0] if np.ndim(theta) == 1 else c
+
+
+def labels_T_from_nufit_bestfit() -> np.ndarray:
+    """NuFIT 6.0 best fit of T as a conditioning point, shape (1, 5)."""
+    return nufit_T()[0][None, :]
+
+
+def noisy_labels_T(theta, rng: np.random.Generator) -> np.ndarray:
+    """
+    T(theta) plus Gaussian noise with sigma_i = (3-sigma half-width)/3, i.e. the
+    same sigma_i that define chi2() above, so that the likelihood implied by the
+    training data is exp(-chi2/2).  Shape (N, 5).
+    """
+    T = np.atleast_2d(observables_T(theta))
+    sigma = nufit_T()[1] / 3.0
+    return T + sigma * rng.standard_normal(T.shape)
+
+
+# --------------------------------------------------------------------------- #
+# Reproducible chunked simulation (for multiprocessing / caching)
+# --------------------------------------------------------------------------- #
+
+def simulate_prior_chunk(seed: int, index: int, n: int, labels: str = "L",
+                         label_noise: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Draw chunk number `index` of a training set: n prior samples and their labels,
+    both float32.  The chunk's RNG depends only on (seed, index), so a data set
+    built from chunks 0..K-1 is identical however the chunks are distributed over
+    worker processes, and its first rows do not depend on the total size.
+
+    labels = "L": the 11-dim deterministic label of `simulate` (paper default).
+    labels = "T": the 5-dim observables of `observables_T`, plus Gaussian noise
+                  from `noisy_labels_T` if label_noise is set.
+    """
+    rng = np.random.default_rng([seed, index])
+    theta = sample_prior(n, rng)
+    if labels == "L":
+        if label_noise:
+            raise ValueError("label_noise is only defined for labels='T'")
+        x = simulate(theta)
+    elif labels == "T":
+        x = noisy_labels_T(theta, rng) if label_noise else observables_T(theta)
+    else:
+        raise ValueError(f"unknown labels {labels!r}")
+    return theta.astype(np.float32), np.atleast_2d(x).astype(np.float32)
 
 
 # --------------------------------------------------------------------------- #

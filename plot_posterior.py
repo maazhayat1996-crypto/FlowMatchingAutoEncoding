@@ -189,7 +189,7 @@ def main():
     Gcut = G[sel]
     print(f"{len(G):,} samples, {sel.sum():,} with chi2 < {a.cut:g}")
 
-    T = S.observables_T(G); Tcut = T[sel]
+    T = S.observables_T_chunked(G); Tcut = T[sel]
     q = S.derived_quantities(Gcut)
 
     plot_chi2(chi2, a.cut, outdir / "chi2.png")
