@@ -3,7 +3,7 @@
 # Run on the LOGIN node from the repository root:   bash spartan/setup_env.sh
 #
 # Edit before running:
-#   FM_PROJECT   your project directory (<projectID>, e.g. punim1234)
+#   FM_PROJECT   your project directory (here punim0011/mhhaya)
 #   TORCH_INDEX  PyTorch wheel index matching the GPU driver.  Run `nvidia-smi`
 #                inside a GPU job (spartan/smoke.slurm prints it): the "CUDA
 #                Version" in its header is the newest CUDA the driver supports.
@@ -15,7 +15,7 @@
 #                change the torch pin in requirements.txt to match.
 set -eo pipefail
 
-FM_PROJECT=${FM_PROJECT:-/data/gpfs/projects/<projectID>}
+FM_PROJECT=${FM_PROJECT:-/data/gpfs/projects/punim0011/mhhaya}
 case $FM_PROJECT in *"<projectID>"*) echo "set FM_PROJECT or edit <projectID> in spartan/setup_env.sh first" >&2; exit 1;; esac
 VENV=${VENV:-$HOME/venvs/fmpe}
 TORCH_INDEX=${TORCH_INDEX:-https://download.pytorch.org/whl/cu126}   # <-- PLACEHOLDER: match the driver (see top)

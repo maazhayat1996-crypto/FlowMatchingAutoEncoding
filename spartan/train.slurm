@@ -3,7 +3,7 @@
 # run dir is $FM_RUNS_DIR/<timestamp>-<jobid>).  Adjust --time/--mem at
 # submission for larger tiers, e.g.
 #   sbatch --time=1-00:00:00 spartan/train.slurm --n-sims 30000000 --n-post 200000 \
-#       --batch 1024 --lr 1e-3 --sims-cache /data/gpfs/projects/<projectID>/fmpe/runs/sims_3e7_seed0.npz
+#       --batch 1024 --lr 1e-3 --sims-cache /data/gpfs/projects/punim0011/mhhaya/fmpe/runs/sims_3e7_seed0.npz
 #   FM_RESUME=<run dir> sbatch spartan/train.slurm        # continue by hand
 # Exit status 3 (time budget used up) resubmits this script with the same args.
 #SBATCH --job-name=fmpe-train
@@ -12,11 +12,11 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=8:00:00
-#SBATCH -o /data/gpfs/projects/<projectID>/fmpe/runs/logs/%x-%j.out
-#SBATCH -e /data/gpfs/projects/<projectID>/fmpe/runs/logs/%x-%j.err
+#SBATCH -o /data/gpfs/projects/punim0011/mhhaya/fmpe/runs/logs/%x-%j.out
+#SBATCH -e /data/gpfs/projects/punim0011/mhhaya/fmpe/runs/logs/%x-%j.err
 
 # ---- placeholders: project directory and repository checkout ---------------- #
-FM_PROJECT="/data/gpfs/projects/<projectID>"
+FM_PROJECT="/data/gpfs/projects/punim0011/mhhaya"
 FM_REPO="$FM_PROJECT/FlowMatchingAutoEncoding"
 case $FM_PROJECT in *"<projectID>"*) echo "fill in <projectID> in spartan/* first" >&2; exit 1;; esac
 export FM_RUNS_DIR=$FM_PROJECT/fmpe/runs

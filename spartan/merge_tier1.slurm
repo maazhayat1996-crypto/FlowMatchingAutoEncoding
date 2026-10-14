@@ -7,11 +7,11 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=16G
 #SBATCH --time=0:20:00
-#SBATCH -o /data/gpfs/projects/<projectID>/fmpe/runs/logs/%x-%j.out
-#SBATCH -e /data/gpfs/projects/<projectID>/fmpe/runs/logs/%x-%j.err
+#SBATCH -o /data/gpfs/projects/punim0011/mhhaya/fmpe/runs/logs/%x-%j.out
+#SBATCH -e /data/gpfs/projects/punim0011/mhhaya/fmpe/runs/logs/%x-%j.err
 
 # ---- placeholders: project directory and repository checkout ---------------- #
-FM_PROJECT="/data/gpfs/projects/<projectID>"
+FM_PROJECT="/data/gpfs/projects/punim0011/mhhaya"
 FM_REPO="$FM_PROJECT/FlowMatchingAutoEncoding"
 case $FM_PROJECT in *"<projectID>"*) echo "fill in <projectID> in spartan/* first" >&2; exit 1;; esac
 export FM_RUNS_DIR=$FM_PROJECT/fmpe/runs
