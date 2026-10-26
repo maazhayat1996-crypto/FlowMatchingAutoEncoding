@@ -10,6 +10,7 @@ Reproduces the FMPE pipeline of arXiv:2608.15042 (Kitagawa, Nishimura, Otsuka).
 | `sample_posterior.py` | posterior draws from a trained run (one Slurm array task per seed); `--benchmark` |
 | `merge_samples.py` | combine `RUN/samples/*` into `RUN/G_samples.npy` / `chi2.npy` / `samples_summary.json` |
 | `plot_posterior.py` | figures from `G_samples.npy` / `chi2.npy` into `RUN/figures/` |
+| `intrinsic_dim.py` | intrinsic dimension of the χ² < cut samples in observable space, with calibrating nulls (`RUN/intrinsic_dim_chi2lt<cut>.json`, `RUN/figures/`) |
 | `spartan/` | Slurm scripts and the one-time environment setup |
 
 Locally: `python trainer.py --quick --device cpu`, then `python plot_posterior.py runs/<timestamp>`. Every hyperparameter is a flag; see `python trainer.py --help`.
@@ -96,3 +97,22 @@ A resumed run continues exactly where it stopped, with the same weights, Adam st
 - sbi's ODE sampler (zuko, adaptive) exposes only `atol`/`rtol`, available as `--ode-atol`/`--ode-rtol` (sbi defaults 1e-6 / 1e-5). There is no step count.
 - TF32 matmuls are on for training on CUDA (`--no-tf32` disables them) and always off for sampling.
 - Larger tiers use `spartan/train.slurm`, which passes its arguments to `trainer.py`. See the header of that script.
+
+## Tier 3 (1e8 simulations, 3e7 draws)
+
+Same network and optimiser as Tier 1; only the data grow, and the stopping rule is adapted to 10x longer epochs (Tier 1 plateaued after ~40 of its 146 epochs).
+
+| | Tier 1 | Tier 3 |
+|---|---|---|
+| simulations | 1e7 | 1e8 (`sims_1e8_seed0.npz`, ~14 GB; its first 1e7 rows are the Tier 1 set) |
+| early stopping / epoch cap | patience 20 / none | patience 10 / 40 epochs (~38 min each) |
+| checkpoint interval | 10 epochs | 2 epochs |
+| job | 8 h, 64G | 36 h, 128G |
+| bulk draws | 10 x 3e5 | 30 x 1e6 |
+
+```bash
+sbatch spartan/train_tier3.slurm                       # ~26 h of training; resubmits itself if needed
+FM_RUN=<run dir> sbatch spartan/sample_tier3.slurm     # after training; check summary.json samples/s first
+FM_RUN=<run dir> sbatch --dependency=afterok:<array job id> spartan/merge_tier3.slurm
+```
+Disk: about 14 GB for the simulation cache, 1 GB per checkpoint, and about 5.5 GB of merged samples. `punim0011` is a shared project, so check its quota first.
